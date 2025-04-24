@@ -22,6 +22,77 @@ class SupabaseUploader:
             raise ValueError("Supabase URL and key must be provided or set as environment variables")
         
         self.supabase = create_client(self.supabase_url, self.supabase_key)
+        
+        # Member ID mapping dictionary
+        self.member_id_mapping = {}
+        self.next_id = 1
+    
+    def assign_internal_unique_ids(self, df):
+        """
+        Assign a unique ID to each unique member_full_name and add it to the DataFrame.
+        
+        Args:
+            df: pandas DataFrame containing member_full_name column
+            
+        Returns:
+            DataFrame with internal_unique_id column added
+        """
+        # Create a copy to avoid modifying the original
+        result_df = df.copy()
+        
+        # Check if we need to initialize the mapping from existing data
+        if not self.member_id_mapping:
+            try:
+                # Try to get existing member IDs from the database
+                print("Fetching existing member IDs from database...")
+                response = self.supabase.table("house_travel_reports") \
+                    .select("member_full_name, internal_unique_id") \
+                    .execute()
+                
+                # Process results and update our mapping
+                if response.data:
+                    for record in response.data:
+                        name = record.get('member_full_name')
+                        id_val = record.get('internal_unique_id')
+                        if name and id_val and name not in self.member_id_mapping:
+                            self.member_id_mapping[name] = id_val
+                            # Update next_id to be greater than any existing ID
+                            self.next_id = max(self.next_id, id_val + 1)
+                    
+                    print(f"Loaded {len(self.member_id_mapping)} existing member IDs")
+                    print(f"Next available ID: {self.next_id}")
+            
+            except Exception as e:
+                print(f"Error fetching existing member IDs: {str(e)}")
+                print("Will create new IDs for all members")
+        
+        # Now assign IDs to the current DataFrame
+        # Create a new column for the internal unique ID
+        def get_or_assign_id(name):
+            if pd.isna(name) or name == 'badvalue':
+                # Handle null/missing names by assigning a special ID (e.g., 0)
+                return 0
+            
+            if name not in self.member_id_mapping:
+                self.member_id_mapping[name] = self.next_id
+                self.next_id += 1
+            
+            return self.member_id_mapping[name]
+        
+        # Apply the function to create the internal_unique_id column
+        result_df['internal_unique_id'] = result_df['member_full_name'].apply(get_or_assign_id)
+        
+        # Display mapping for debugging
+        print(f"Total unique members: {len(self.member_id_mapping)}")
+        print("Sample of member ID mapping:")
+        i = 0
+        for name, id_val in self.member_id_mapping.items():
+            print(f"  {name}: {id_val}")
+            i += 1
+            if i >= 5:  # Show just a few examples
+                break
+        
+        return result_df
     
     def map_fields(self, df, field_mapping=None):
         """
@@ -39,6 +110,7 @@ class SupabaseUploader:
             'docid', 'report_year', 
             'filer_first_name', 'filer_last_name',
             'member_first_name', 'member_last_name', 'member_full_name',
+            'internal_unique_id',  # Added this column to the schema
             'member_state', 'member_district', 'filingtype',
             'destination_city', 'destination_state',
             'departuredate', 'returndate', 
@@ -57,46 +129,49 @@ class SupabaseUploader:
         mapped_df = mapped_df[columns_to_keep]
         
         return mapped_df
-    ##This function cleans up holes in the data where there are NaN values
+        
     def handle_nan_values(self, df):
-            """
-            Clean the DataFrame by replacing NaN values with appropriate values based on column type.
+        """
+        Clean the DataFrame by replacing NaN values with appropriate values based on column type.
+        
+        Args:
+            df: pandas DataFrame to clean
             
-            Args:
-                df: pandas DataFrame to clean
-                
-            Returns:
-                DataFrame with NaN values replaced appropriately
-            """
-            # Make a copy to avoid modifying the original
-            clean_df = df.copy()
-            
-            # Automatically determine column types from data
-            numeric_columns = []
-            text_columns = []
-            
-            for col in clean_df.columns:
-                # Check if column has integer or float data type
-                if pd.api.types.is_numeric_dtype(clean_df[col]):
-                    numeric_columns.append(col)
-                else:
-                    text_columns.append(col)
-            
-            print(f"Detected numeric columns: {numeric_columns}")
-            print(f"Detected text columns: {text_columns}")
-            
-            # Replace NaN in text columns with 'badvalue'
-            for col in text_columns:
-                clean_df[col] = clean_df[col].fillna('badvalue')
-            
-            # For numeric columns, preserve the NaN as None for database NULL
-            for col in numeric_columns:
-                # If it's an integer column, convert to nullable integer
-                if pd.api.types.is_integer_dtype(clean_df[col]):
-                    clean_df[col] = clean_df[col].astype('Int64')  # Pandas nullable integer type
-                # If it's a float column, leave as is (NaN will become None/null in JSON)
-            
-            return clean_df
+        Returns:
+            DataFrame with NaN values replaced appropriately
+        """
+        # Make a copy to avoid modifying the original
+        clean_df = df.copy()
+        
+        # Automatically determine column types from data
+        numeric_columns = []
+        text_columns = []
+        
+        for col in clean_df.columns:
+            # Check if column has integer or float data type
+            if pd.api.types.is_numeric_dtype(clean_df[col]):
+                numeric_columns.append(col)
+            else:
+                text_columns.append(col)
+        
+        print(f"Detected numeric columns: {numeric_columns}")
+        print(f"Detected text columns: {text_columns}")
+        
+        # Replace NaN in text columns with 'badvalue'
+        for col in text_columns:
+            clean_df[col] = clean_df[col].fillna('badvalue')
+        
+        # For numeric columns, preserve the NaN as None for database NULL
+        for col in numeric_columns:
+            # Ensure internal_unique_id is never NULL
+            if col == 'internal_unique_id':
+                clean_df[col] = clean_df[col].fillna(0).astype('Int64')
+            # If it's an integer column, convert to nullable integer
+            elif pd.api.types.is_integer_dtype(clean_df[col]):
+                clean_df[col] = clean_df[col].astype('Int64')  # Pandas nullable integer type
+            # If it's a float column, leave as is (NaN will become None/null in JSON)
+        
+        return clean_df
     
     def upload_data(self, df, table_name="house_travel_reports", field_mapping=None, max_records=None):
         """
@@ -113,6 +188,7 @@ class SupabaseUploader:
         """
         # Make a copy to avoid modifying the original
         upload_df = df.copy()
+        
         # Apply the field mapping if provided
         if field_mapping:
             for old_name, new_name in field_mapping.items():
@@ -120,9 +196,11 @@ class SupabaseUploader:
                     upload_df = upload_df.rename(columns={old_name: new_name})
                     print(f"Renamed column '{old_name}' to '{new_name}'")
         
+        # Assign internal unique IDs
+        upload_df = self.assign_internal_unique_ids(upload_df)
+        
         # Now prepare the DataFrame for upload after renaming
-        if hasattr(self, 'map_fields'):
-            upload_df = self.map_fields(upload_df)
+        upload_df = self.map_fields(upload_df)
         
         # Handle NaN values appropriately
         upload_df = self.handle_nan_values(upload_df)
@@ -177,6 +255,7 @@ class SupabaseUploader:
                 if len(records) > 0:
                     minimal_record = {
                         'report_year': records[0].get('report_year', '2025'),
+                        'internal_unique_id': 0,  # Ensure this field is present
                         'date_scraped': records[0].get('date_scraped', '2025-04-05')
                     }
                     test_result = self.supabase.table(table_name).insert([minimal_record]).execute()
@@ -197,6 +276,7 @@ class SupabaseUploader:
                 print(f"Error in error handler: {str(e3)}")
             
             return None
+
 # Example usage
 if __name__ == "__main__":
     # Load data from CSV (generated by the scraper)
@@ -204,4 +284,9 @@ if __name__ == "__main__":
     
     # Initialize uploader and upload data
     uploader = SupabaseUploader()  # This will use credentials from .env file
-    uploader.upload_data(df) ##TESTING added max_records = 10 - remove for real thing
+    
+    # You can test with a smaller set first
+    # result = uploader.upload_data(df, max_records=10)
+    
+    # For production, use the full dataset
+    result = uploader.upload_data(df)

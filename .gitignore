@@ -32,3 +32,6 @@ var/
 # Virtual environment
 venv/
 ENV/
+
+#Headshots folder
+member-headshots/
